@@ -5,8 +5,62 @@ struct ResizeCommand: Command { // todo cover with tests
     let args: ResizeCmdArgs
     /*conforms*/ var shouldResetClosedWindowsCache = true
 
-    func run(_ env: CmdEnv, _ io: CmdIo) -> Bool {
+    func run(_ env: CmdEnv, _ io: CmdIo) async throws -> Bool {
         guard let target = args.resolveTargetOrReportError(env, io) else { return false }
+
+        if let window = target.windowOrNil, window.isFloating {
+            guard let size = try await window.getAxSize(), let topLeftCorner = try await window.getAxTopLeftCorner() else { return false }
+            let monitorRect = target.workspace.workspaceMonitor.visibleRect
+
+            let computeTopLeftCornerAndSize = { (diffSize: CGSize) -> (CGPoint, CGSize) in
+                var newWidth = max(1, size.width + diffSize.width)
+                var newHeight = max(1, size.height + diffSize.height)
+                newWidth = min(newWidth, monitorRect.width)
+                newHeight = min(newHeight, monitorRect.height)
+
+                let centeredTopLeftX = topLeftCorner.x - diffSize.width / 2
+                let centeredTopLeftY = topLeftCorner.y - diffSize.height / 2
+                let clampedTopLeftX = min(max(centeredTopLeftX, monitorRect.minX), monitorRect.maxX - newWidth)
+                let clampedTopLeftY = min(max(centeredTopLeftY, monitorRect.minY), monitorRect.maxY - newHeight)
+
+                return (CGPoint(x: clampedTopLeftX, y: clampedTopLeftY), CGSize(width: newWidth, height: newHeight))
+            }
+
+            let isWidthDominant = size.width >= size.height
+            let diff: CGFloat = switch (args.units.val, args.dimension.val) {
+                case (.set(let unit), .width): CGFloat(unit) - size.width
+                case (.set(let unit), .height): CGFloat(unit) - size.height
+                case (.set(let unit), .smart): CGFloat(unit) - (isWidthDominant ? size.width : size.height)
+                case (.set(let unit), .smartOpposite): CGFloat(unit) - (isWidthDominant ? size.height : size.width)
+                case (.add(let unit), _): CGFloat(unit)
+                case (.subtract(let unit), _): -CGFloat(unit)
+            }
+
+            let newTopLeftCorner: CGPoint
+            let newSize: CGSize
+            switch args.dimension.val {
+                case .width:
+                    (newTopLeftCorner, newSize) = computeTopLeftCornerAndSize(CGSize(width: diff, height: 0))
+                case .height:
+                    (newTopLeftCorner, newSize) = computeTopLeftCornerAndSize(CGSize(width: 0, height: diff))
+                case .smart:
+                    let diffSize = if isWidthDominant {
+                        CGSize(width: diff, height: diff * (size.height / size.width))
+                    } else {
+                        CGSize(width: diff * (size.width / size.height), height: diff)
+                    }
+                    (newTopLeftCorner, newSize) = computeTopLeftCornerAndSize(diffSize)
+                case .smartOpposite:
+                    let diffSize = if isWidthDominant {
+                        CGSize(width: diff * (size.width / size.height), height: diff)
+                    } else {
+                        CGSize(width: diff, height: diff * (size.height / size.width))
+                    }
+                    (newTopLeftCorner, newSize) = computeTopLeftCornerAndSize(diffSize)
+            }
+            try await window.setAxFrameBlocking(newTopLeftCorner, newSize)
+            return true
+        }
 
         let candidates = target.windowOrNil?.parentsWithSelf
             .filter { ($0.parent as? TilingContainer)?.layout == .tiles }
@@ -33,7 +87,7 @@ struct ResizeCommand: Command { // todo cover with tests
                 node = candidates.first(where: { ($0.parent as? TilingContainer)?.orientation == orientation })
                 parent = node?.parent as? TilingContainer
         }
-        guard let parent else { return io.err("resize command doesn't support floating windows yet https://github.com/nikitabobko/AeroSpace/issues/9") }
+        guard let parent else { return io.err("resize command supports only `tiles` layout") }
         guard let orientation else { return false }
         guard let node else { return false }
         let diff: CGFloat = switch args.units.val {
